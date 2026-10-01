@@ -14,6 +14,12 @@ import { nightK } from '../../render/daynight.js';
 
 const BASE = '/assets/audio/';
 const STEMS = ['day', 'night', 'pulseA', 'pulseB'];
+// (user r-orch) orchestral superhero score (tools/audio/orchestral_v2.py --game): three synchronised 20 s loops on one
+// grid (D minor, 96 BPM, 8 bars, same progression), switched at bar lines so every change lands in harmony:
+//   swing  = traversal (swinging / air / zips / wall runs at speed)   hero = a sustained fast swing streak (>= HERO_T s)
+//   combat = an engaged fight                                          (idle / walking = the ambient day / night beds)
+const ORCH = { hero: 'music_orch_hero.ogg', swing: 'music_orch_swing.ogg', combat: 'music_orch_combat.ogg' };
+const ORCH_BAR = 2.5, HERO_T = 14, ORCH_LINGER = 6;
 const SPRITE_BUS = { trav: 'sfx', combat: 'sfx', ui: 'ui', world: 'ambience' };
 const clamp = THREE.MathUtils.clamp;
 const sstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
@@ -26,10 +32,12 @@ export function createAudio() {
   // (user r-mixdefaults) the user's tuned mix was master 80 % with music 4 / effects 16 / ambience 10 / interface 6 %
   // (music already x0.09 internally). That exact mix is now the default at master 100 % and every other slider at 70 %:
   // TRIM folds the old master (0.8) and the found slider levels into each bus, so bus gain = slider x TRIM.
-  const MIX = { master: 0.8, music: 0.04 * 0.09, sfx: 0.16, ambience: 0.10, ui: 0.06 }, D = 0.7;
+  const MIX = { master: 0.8, music: 0.04 * 0.09 * 1.4, sfx: 0.16, ambience: 0.10, ui: 0.06 }, D = 0.7; // (user r-musicup) music x1.4 (+3 dB): "increase music volume a bit"
   const TRIM = { music: MIX.master * MIX.music / D, sfx: MIX.master * MIX.sfx / D, ambience: MIX.master * MIX.ambience / D, ui: MIX.master * MIX.ui / D };
   const bus = {}, bufs = {}, mbufs = {}, lbufs = {}, voices = new Map();
   const music = { started: false, t0: 0, layer: {}, night: 0, I: 0, dayG: 0, nightG: 0, aG: 0, bG: 0 };
+  // orchestral layer: cur = the playing component (null = ambient beds), want = the requested one, k = orchestra vs beds
+  const orch = { started: false, t0: 0, layer: {}, cur: null, want: null, switchAt: 0, k: 0, travT: 0, calmT: 99, bufs: {} };
   const listenerPos = new THREE.Vector3(), _f = new THREE.Vector3();
   const loops = new Map(); // id -> { kind, pos, src, gain, panner }
   let paused = false, combat = false;
@@ -71,6 +79,8 @@ export function createAudio() {
       await Promise.all(Object.entries(man.loops).map(async ([k, s]) => { lbufs[k] = await fetchBuf(s.url); }));
       for (const k of STEMS) if (man.music[k]) mbufs[k] = await fetchBuf(man.music[k].url);
       startMusic();
+      try { for (const [k, f] of Object.entries(ORCH)) orch.bufs[k] = await fetchBuf(BASE + f); startOrch(); }
+      catch (e) { console.warn('[audio] orchestral score missing (python3 tools/audio/orchestral_v2.py --game):', e?.message || e); }
     } catch (e) { loadErr = String(e?.message || e); console.warn('[audio] load failed:', loadErr); }
   }
 
@@ -86,6 +96,43 @@ export function createAudio() {
     music.started = true;
     // slow fade-in of the whole score
     musicDuck.gain.setValueAtTime(0, t0); musicDuck.gain.linearRampToValueAtTime(1, t0 + 5);
+  }
+  function startOrch() { // all components start together and loop forever (silent until chosen): they never drift apart
+    if (orch.started || !Object.keys(ORCH).every(k => orch.bufs[k])) return;
+    const t0 = now() + 0.3; orch.t0 = t0;
+    for (const k of Object.keys(ORCH)) {
+      const s = ac.createBufferSource(); s.buffer = orch.bufs[k]; s.loop = true;
+      const g = G(0); s.connect(g).connect(bus.music); s.start(t0);
+      orch.layer[k] = { s, g };
+    }
+    orch.started = true;
+  }
+  const nextBar = (t) => orch.t0 + Math.ceil((t - orch.t0 + 0.05) / ORCH_BAR) * ORCH_BAR;
+  // per frame: pick the wanted component, switch at the next bar line (short equal-power crossfade across the line),
+  // fade the whole orchestra in / out against the ambient beds
+  function orchUpdate(dt, t, trav, speed) {
+    if (!orch.started) return 0;
+    const fast = trav && speed > 14;
+    orch.travT = fast ? orch.travT + dt : Math.max(0, orch.travT - dt * 2);
+    orch.calmT = trav && speed > 6 || combat ? 0 : orch.calmT + dt;
+    let want = null;
+    if (combat) want = 'combat';
+    else if (trav && speed > 6) want = orch.travT >= HERO_T || orch.cur === 'hero' ? 'hero' : 'swing'; // a long fast streak earns the anthem, kept until he stops
+    else if (orch.calmT < ORCH_LINGER) want = orch.cur;                 // brief stops (a perch, a landing) keep the piece going
+    if (paused) want = orch.cur;                                         // the pause menu muffles (musicLP), it never changes the piece
+    if (want !== orch.want) { orch.want = want; orch.switchAt = want && orch.cur ? nextBar(t) : t; } // first entry: at once (fades in)
+    if (orch.want !== orch.cur && t >= orch.switchAt - 0.12) {
+      const at = Math.max(t, orch.switchAt - 0.12);
+      for (const [k, L] of Object.entries(orch.layer)) {
+        const on = k === orch.want;
+        L.g.gain.cancelScheduledValues(at); L.g.gain.setValueAtTime(L.g.gain.value, at);
+        if (orch.cur === null || orch.want === null) L.g.gain.setTargetAtTime(on ? 1 : 0, at, on ? 0.8 : 1.4); // entering / leaving the orchestra: slow
+        else L.g.gain.setTargetAtTime(on ? 1 : 0, at, on ? 0.09 : 0.16);   // component change: quick, across the bar line
+      }
+      orch.cur = orch.want;
+    }
+    orch.k += ((orch.cur ? 1 : 0) - orch.k) * Math.min(1, dt / (orch.cur ? 1.2 : 3.0));
+    return orch.k;
   }
   function duck(amount = 0.4, hold = 0.8, release = 0.9) {
     if (!ready || !music.started) return;
@@ -235,9 +282,10 @@ export function createAudio() {
       if (paused) target = 0;
       const tau = target > music.I ? 1.1 : 5.5; // rise quickly, linger after the swing ends
       music.I += (target - music.I) * Math.min(1, dt / tau);
-      const bed = 1 - 0.18 * music.I;
+      const ok = orchUpdate(dt, t, trav, speed); // the orchestra takes over from the beds + swing pulses
+      const bed = (1 - 0.18 * music.I) * (1 - ok);
       music.dayG = Math.cos(music.night * Math.PI / 2) * bed; music.nightG = Math.sin(music.night * Math.PI / 2) * bed;
-      music.aG = sstep(0.06, 0.45, music.I) * 0.95; music.bG = sstep(0.5, 0.92, music.I) * 0.9;
+      music.aG = sstep(0.06, 0.45, music.I) * 0.95 * (1 - ok); music.bG = sstep(0.5, 0.92, music.I) * 0.9 * (1 - ok);
       const L = music.layer;
       L.day.g.gain.setTargetAtTime(music.dayG, t, 0.15); L.night.g.gain.setTargetAtTime(music.nightG, t, 0.15);
       L.pulseA.g.gain.setTargetAtTime(music.aG, t, 0.2); L.pulseB.g.gain.setTargetAtTime(music.bG, t, 0.25);
@@ -271,7 +319,8 @@ export function createAudio() {
   function state() {
     const r3 = x => Math.round(x * 1000) / 1000;
     return { ready, ctx: ac?.state || 'none', sr: ac?.sampleRate, loadErr, sprites: Object.keys(bufs), loops: Object.keys(lbufs), stems: Object.keys(mbufs),
-      music: { started: music.started, pos: music.started ? r3(((now() - music.t0) % (mbufs.day?.duration || 1))) : 0, I: r3(music.I), night: r3(music.night), day: r3(music.dayG), nightG: r3(music.nightG), pulseA: r3(music.aG), pulseB: r3(music.bG) },
+      music: { started: music.started, pos: music.started ? r3(((now() - music.t0) % (mbufs.day?.duration || 1))) : 0, I: r3(music.I), night: r3(music.night), day: r3(music.dayG), nightG: r3(music.nightG), pulseA: r3(music.aG), pulseB: r3(music.bG),
+        orch: { started: orch.started, cur: orch.cur, want: orch.want, k: r3(orch.k), travT: r3(orch.travT), gains: Object.fromEntries(Object.entries(orch.layer).map(([k, L]) => [k, r3(L.g.gain.value)])) } },
       voices: [...voices.values()].reduce((a, v) => a + v.length, 0), activeLoops: loops.size };
   }
 

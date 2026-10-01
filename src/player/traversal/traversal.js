@@ -43,6 +43,13 @@ const REL_UP = 9;           // every swing release: upward pop (m/s; vy = max(vy
 const REL_UP_VY = 16;       // user r10f: chained swings must climb ("give more height after each swing"); Space-release pops higher
 const SWING_DIP = 6;
 const SWING_GAIN = 5;       // climb assist target: exit this far above the attach height (m) — user r10f        // max arc dip below the attach height (m) — user r10f
+// (user r-anim7) "give a visible boost to height and speed when i do a 50%+ swing": swing completion = how far the rope
+// got (furthest angle reached) from its attach angle toward the mirrored angle on the far side (0.5 = released at the bottom, 1 = a full
+// symmetric arc). From 50 % it adds forward speed and an extra upward pop, ramping to full at FULL_SWING_K; the speed cap
+// is raised by the same amount so it is not clamped away. The camera gets a FOV kick (event 'swingBoost').
+const FULL_SWING_FWD = 7;   // m/s forward at full completion
+const FULL_SWING_UP = 7;    // m/s extra upward pop (and cap) at full completion
+const FULL_SWING_K = 0.85;  // completion at which the boost is full
 const RELEASE_BOOST = 1.5; // m/s added along the release velocity when the web is let go (x skill 'swingReleaseBoost')
 const SWING_DRAG = 0.0022;  // aerodynamic drag while swinging (1/m): a held swing with no input decays like a real pendulum
 const PUMP_MAX_ANG = 1.15;  // pumping (W along the swing) never adds energy beyond what reaches ~75 deg of arc (chains stay in the canyon)
@@ -726,7 +733,7 @@ export function createTraversal({ world, cam, web, rig, camera }) {
         S.ropeTarget = Math.max(S.ropeTarget, s.pos.distanceTo(S.pivot) - 1);
       } }
     S.rope = s.pos.distanceTo(S.pivot); S.t = 0; S.tension = 0; S.tautT = 0; S.cornered = false; S.y0 = s.pos.y;
-    S.slack = 0; S.slackT = 0; S.kick = 0; S.kickCd = 0; S.apexed = false; S.angMax = -9;
+    S.slack = 0; S.slackT = 0; S.kick = 0; S.kickCd = 0; S.apexed = false; S.angMax = -9; S.ang0 = null; // ang0: attach angle (swing completion)
     // momentum conservation: redirect velocity along the swing tangent keeping speed (dive speed becomes swing speed)
     const rd = _v.copy(S.pivot).sub(s.pos).normalize();
     const sp = s.vel.length(), vr = s.vel.dot(rd);
@@ -903,7 +910,7 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     const f2 = floorAt(s.pos.x, s.pos.z, feetY() + 0.4);
     if (feetY() < f2 + 0.3) { s.pos.y = f2 + 0.3 + H; if (s.vel.y < 0) s.vel.y = 0; }
     // phase / sub-state
-    S.phase = swingPhase(); S.angle = swingAngle();
+    S.phase = swingPhase(); S.angle = swingAngle(); if (S.ang0 == null) S.ang0 = S.angle;
     S.angMax = Math.max(S.angMax ?? -9, S.angle);
     if (!S.apexed && (S.angle < S.angMax - 0.06 && S.angMax > 0.2 || S.t > 4)) S.apexed = true;
     if (S.kick > 0.3) setSub('wallKick');
@@ -1008,10 +1015,15 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     const sp = s.vel.length();
     if (sp > 0.5) s.vel.multiplyScalar((sp + releaseBoost() + CHAIN_REL * (s.chain || 0)) / sp); // + momentum chain (r10g)
     const k = releaseBoost() / RELEASE_BOOST, hv = hdir(s.vel, new THREE.Vector3()) || new THREE.Vector3(Math.sin(s.facing), 0, Math.cos(s.facing));
-    if (kind !== 'jump') s.vel.y = Math.min(Math.max(s.vel.y, REL_UP_VY), Math.max(s.vel.y + REL_UP * k, REL_UP * 0.75 * k));
+    // full-swing boost (user r-anim7): completion of the arc since the attach angle
+    const Sw = s.swing, a0 = Sw.ang0 ?? swingAngle(), comp = clamp((Math.max(swingAngle(), Sw.angMax ?? -9) - a0) / Math.max(2 * Math.abs(a0), 0.5), 0, 1.5); // furthest point the arc reached
+    const fb = THREE.MathUtils.smoothstep(comp, 0.5, FULL_SWING_K) * (Sw.t > 0.35 ? 1 : 0), upB = FULL_SWING_UP * fb;
+    s.lastSwingComp = +comp.toFixed(2); s.lastBoost = +fb.toFixed(2);
+    if (fb > 0) { s.vel.x += hv.x * FULL_SWING_FWD * fb; s.vel.z += hv.z * FULL_SWING_FWD * fb; events.push({ type: 'swingBoost', k: fb, comp }); }
+    if (kind !== 'jump') s.vel.y = Math.min(Math.max(s.vel.y, REL_UP_VY + upB), Math.max(s.vel.y + REL_UP * k + upB, (REL_UP * 0.75 * k) + upB));
     if (kind === 'jump') { // user r11: Space-release = stronger forward push + a jump-off-the-web pop up
       s.vel.x += hv.x * SWING_JUMP * k; s.vel.z += hv.z * SWING_JUMP * k;
-      s.vel.y = Math.min(SWING_JUMP_VY, Math.max(s.vel.y + SWING_JUMP_UP, SWING_JUMP_UP * 0.85));
+      s.vel.y = Math.min(SWING_JUMP_VY + upB, Math.max(s.vel.y + SWING_JUMP_UP + upB, SWING_JUMP_UP * 0.85 + upB));
       s.jumpRelHold = true; // user r10c: with RMB still held the next web re-attached ~0.35 s later and ate the pop — no new web until the apex
     }
     setMode('air', 'release'); s.airT = 0; s.apexY = feetY();
@@ -1023,8 +1035,8 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     if (force ? force !== 'none' && room : room && (!s.lastTrick || rnd() < 0.8)) { startTrick(TRICK_DEF[force] ? force : chooseTrick(I)); s.lastTrick = true; }
     else { s.trick = null; s.lastTrick = false; s.vel.x += hv.x * REL_NOTRICK * k; s.vel.z += hv.z * REL_NOTRICK * k; }
     s.trickNoUp = false; // user r10f: every release gains height again (the trick's small `up` lands at its snap too)
-    const hs = Math.hypot(s.vel.x, s.vel.z), hl = Math.max(vmaxC(), sp); if (hs > hl) { s.vel.x *= hl / hs; s.vel.z *= hl / hs; }
-    events.push({ type: 'release', kind, trick: s.trick });
+    const hs = Math.hypot(s.vel.x, s.vel.z), hl = Math.max(vmaxC(), sp) + FULL_SWING_FWD * fb; if (hs > hl) { s.vel.x *= hl / hs; s.vel.z *= hl / hs; }
+    events.push({ type: 'release', kind, trick: s.trick, comp: +comp.toFixed(2), boost: +fb.toFixed(2) });
   }
 
   // ------------------------------------------------------------------ wall
